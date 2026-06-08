@@ -1,0 +1,26 @@
+{
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "username": "admin",
+        "password": "secret"
+    },
+    "api": {
+        "key": "6ff23d545293863e5ac974fb0ee9017cfe3da0694898e396051564f4",
+        "timeout": 30
+    },
+    "paths": {
+        "date": "D://ts_daily//data//dates.pkl",
+        "px": "D://ts_daily//data//px//",
+        "fin": "D://ts_daily//data//fin//",
+        "hy": "D://ts_daily//data//hy//",
+        "MoneyFlow": "D://ts_daily//data//MoneyFlow//",
+        "IndexWgt": "D://ts_daily//data//IndexWgt//",
+        "S1800": "D://ts_daily//data//stock1800_px//",
+        "S1500": "D://ts_daily//data//stock1500//",
+        "S1000": "D:/THU/课程/04-量化投资概论/experiments/day1_code_data/stock1000/data/"
+
+    }
+
+}
+
