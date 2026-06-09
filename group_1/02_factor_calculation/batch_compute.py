@@ -4,10 +4,10 @@ batch_compute.py
 
 功能：
 1. 加载中证1000数据矩阵 dt
-2. 批量计算 45 个候选因子
+2. 批量计算 68 个候选因子（45基础 + 23增强）
 3. 标准化 → 多空收益 → 年化收益/夏普/IC 评价
 4. 筛选 10 个达标因子: |AR|>0.1, |SR|>2, |corr|<0.3
-5. 输出因子相关矩阵热力图
+5. 输出因子相关矩阵热力图 + 五分组收益曲线
 """
 
 # ============================================================================
@@ -48,7 +48,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, _PROJECT_ROOT)
 
 from feature import *
-from tools import read_json_config
+from tools import read_json_config, GetQuantileRet
 # ============================================================================
 # 4. 加载自定义算子
 #    使用 importlib 绕过目录名 "01_feature_engineering" 以数字开头的限制
@@ -240,16 +240,66 @@ def compute_all_factors(dt):
     f['FF_PCT_CHG']       =  dt['pct_chg']                                  # 涨跌幅动量(原负号翻转)
     f['FF_EXRET_5D']      = -ts_Sum(dt['exRet'], 5)
 
+    # ==================================================================
+    # 增强因子 (46-66) — 三大策略提升因子质量
+    # ==================================================================
+
+    # ----- 衰减平滑增强 (46-53) -----
+    # 对近达标因子(SR=1.3~1.8)施加时序衰减，降噪提升SR
+    f['FF_AMOUNT_STD_D40']  = ts_Decay(-ts_Stdev(dt['amount'], 20), 40)       # 1.82→目标2.0+
+    f['FF_TO_F_D20']        = ts_Decay(-dt['turnover_rate_f'], 20)            # 1.55→目标1.8+
+    f['FF_FREEFLOAT_D20']   = ts_Decay(-safe_div(dt['vol'], dt['free_share'], 0), 20)
+    f['FF_AMIHUD_D40']      = ts_Decay(ts_Amihud(dt['totalRet'], dt['amount'], 20), 40)
+    f['FF_TURNOVER_D40']    = ts_Decay(-dt['turnover_rate'], 40)
+    if 'net_mf_amount' in dt and 'amount' in dt:
+        f['FF_NET_MF_D20']  = ts_Decay(-safe_div(dt['net_mf_amount'], dt['amount'] * 1000), 20)
+    f['FF_SKEW_D40']        = ts_Decay(-ts_Skewness(dt['totalRet'], 60), 40)
+    _has_sell = all(k in dt for k in ['sell_lg_vol', 'sell_elg_vol', 'vol'])
+    if _has_sell:
+        f['FF_LARGE_SELL_D40'] = ts_Decay(-safe_div(dt['sell_lg_vol'] + dt['sell_elg_vol'], dt['vol'], 0), 40)
+
+    # ----- 交互/复合因子 (54-61) -----
+    # 截面排名做交互，确保两信号贡献均衡；捕捉条件alpha
+    _r_mom      = pn_Rank(-ts_DecayExp(dt['totalRet'], 21))      # 短期反转排名
+    _r_lowvol   = pn_Rank(-ts_Stdev(dt['totalRet'], 20))         # 低波动排名
+    _r_turnover = pn_Rank(-dt['turnover_rate'])                   # 低换手排名
+    _r_overnight= pn_Rank(dt['overnightRet'])                     # 隔夜动量排名
+
+    f['FF_MOM_LOWVOL']       = _r_mom * _r_lowvol                # 条件反转：低波中的反转更可靠
+    f['FF_OVERNIGHT_LOWVOL'] = _r_overnight * _r_lowvol          # 低波中的隔夜效应
+    f['FF_VWAP_HL']          = -ts_Decay(                        # 借鉴实验脚本：VWAP偏离×振幅
+        safe_div(dt['close'] - dt['vwap'], dt['vwap'])
+        * safe_div(dt['high'] - dt['low'], dt['pre_close']), 40)
+    f['FF_CLOSE_VWAP_DECAY'] = -ts_Decay(safe_div(dt['close'] - dt['vwap'], dt['vwap']), 40)
+    f['FF_CORR_MOM']         = pn_Rank(-ts_Corr(dt['close'], dt['vol'], 20)) * _r_mom
+    f['FF_HL_TURNOVER']      = -safe_div(dt['high'] - dt['low'], dt['pre_close']) * dt['turnover_rate']
+    f['FF_LIQUIDITY_REV']    = _r_turnover * pn_Rank(-ts_Sum(dt['totalRet'], 5))
+    f['FF_EXRET_LOWVOL']     = pn_Rank(-ts_Sum(dt['exRet'], 5)) * _r_lowvol
+
+    # ----- 时序排名因子 (62-65) -----
+    # ts_Rank 提高信号时序稳健性，减少极值干扰
+    f['FF_RANK_MOM']      = -ts_Rank(ts_DecayExp(dt['totalRet'], 21), 60)
+    f['FF_RANK_TURNOVER'] = -ts_Rank(dt['turnover_rate'], 60)
+    f['FF_RANK_VOL']      = -ts_Rank(ts_Stdev(dt['totalRet'], 20), 60)
+    f['FF_RANK_AMIHUD']   = ts_Rank(ts_Amihud(dt['totalRet'], dt['amount'], 20), 60)
+
+    # ----- 其他增强 (66-68) -----
+    f['FF_DECAY_REV_GAP'] = ts_Decay(safe_div(dt['open'] - ts_Delay(dt['close'], 1),
+                                              ts_Delay(dt['close'], 1)), 40)
+    f['FF_EXRET_DECAY']   = -ts_Decay(dt['exRet'], 20)
+    f['FF_VOL_REGIME']    = -ts_Stdev(dt['totalRet'], 20) * Sign(-ts_Sum(dt['totalRet'], 5))
+
     return f
 
 
 # ============================================================================
 # 8. 因子评价函数
 # ============================================================================
-def evaluate_factor(factor_raw, totalRet, univ_mask, sd_per):
+def evaluate_factor(factor_raw, totalRet, univ_mask, sd_per, cost_rate=0.0005):
     """
     评价单个因子: 标准化 → 多空组合 → 因子收益
-    返回: sr, ar, ic_mean, ic_ir, rets, f_stand
+    返回: sr, ar, ic_mean, ic_ir, rets, f_stand,
+          多空分解(ar_pos/ar_neg)、换手率(turnover)、扣费后收益(sr_cost/ar_cost)
     """
     f = factor_raw.copy()
     um_aligned = univ_mask.reindex(index=f.index, columns=f.columns, fill_value=True)
@@ -274,8 +324,29 @@ def evaluate_factor(factor_raw, totalRet, univ_mask, sd_per):
     ic_mean = ics.mean()
     ic_ir   = ics.mean() / ics.std() * np.sqrt(252) if ics.std() > 0 else 0
 
+    # ========== 多空分解 ==========
+    ret_ave = totalRet.mean(axis=1)
+    pos_rets = (port_pos.shift(2) * totalRet).sum(axis=1) - ret_ave
+    neg_rets = (port_neg.shift(2) * totalRet).sum(axis=1) + ret_ave
+    pos_rets = pos_rets[pos_rets.index >= sd_per]
+    neg_rets = neg_rets[neg_rets.index >= sd_per]
+    ar_pos = pos_rets.mean() * 252
+    ar_neg = neg_rets.mean() * 252
+
+    # ========== 换手率与交易成本 ==========
+    turnover_daily = (f_port - f_port.shift(1)).abs().sum(axis=1)
+    turnover_aligned = turnover_daily[turnover_daily.index >= sd_per]
+    turnover_mean = turnover_aligned.mean()
+
+    cost_rets = rets - turnover_aligned * cost_rate
+    sr_cost = cost_rets.mean() / cost_rets.std() * np.sqrt(252) if cost_rets.std() > 0 else 0
+    ar_cost = cost_rets.mean() * 252
+
     return {'sr': sr, 'ar': ar, 'ic_mean': ic_mean, 'ic_ir': ic_ir,
-            'rets': rets, 'f_stand': f_stand}
+            'rets': rets, 'f_stand': f_stand,
+            'ar_pos': ar_pos, 'ar_neg': ar_neg,
+            'turnover': turnover_mean,
+            'sr_cost': sr_cost, 'ar_cost': ar_cost}
 
 
 def _draw_heatmap(ax, data, annot=False, title='', mask_upper=False,
@@ -304,6 +375,28 @@ def _draw_heatmap(ax, data, annot=False, title='', mask_upper=False,
                     text_color = 'white' if abs(val) > 0.5 else 'black'
                     ax.text(j, i, f'{val:.2f}', ha='center', va='center',
                             fontsize=10 if n <= 10 else 7, color=text_color)
+
+
+def _plot_quantile_returns(factor_raw, totalRet, univ_mask, listed_mask,
+                           name, ax, delay=2, n_q=5):
+    """画单个因子的五分位组累积收益曲线（借鉴实验脚本 GetQuantileRet）"""
+    f = factor_raw.copy()
+    f[univ_mask.reindex(index=f.index, columns=f.columns, fill_value=True)] = np.nan
+    f[listed_mask.reindex(index=f.index, columns=f.columns, fill_value=False) == 0] = np.nan
+
+    qr = GetQuantileRet(f, totalRet, n_q, delay)
+    qr_cum = qr.cumsum()
+    colors = plt.cm.RdYlGn(np.linspace(0.2, 0.8, n_q))
+    for i in range(n_q):
+        label = f'Q{i+1}' if i < n_q - 1 else f'Q{i+1}(short)'
+        ax.plot(qr_cum.index, qr_cum.iloc[:, i], color=colors[i],
+                label=label, linewidth=1.2)
+    ars = qr.mean() * 252
+    ax.set_title(f'{name}\n(Q1 AR={ars.iloc[0]:.2f}, Q{n_q} AR={ars.iloc[-1]:.2f})',
+                 fontsize=10)
+    ax.legend(fontsize=7, loc='upper left', ncol=2)
+    ax.axhline(0, color='grey', linestyle='--', linewidth=0.5)
+    ax.tick_params(axis='x', rotation=45, labelsize=7)
 
 
 # ============================================================================
@@ -373,7 +466,9 @@ def main():
                 factor_rets[name]    = res['rets']
                 factor_stands[name]  = res['f_stand']
                 logger.info(f"  {name:25s}  SR={res['sr']:+.3f}  AR={res['ar']:+.3f}  "
-                            f"IC_mean={res['ic_mean']:+.4f}  IC_IR={res['ic_ir']:+.2f}")
+                            f"IC={res['ic_mean']:+.4f}  IC_IR={res['ic_ir']:+.2f}  "
+                            f"LngAR={res['ar_pos']:+.3f}  ShtAR={res['ar_neg']:+.3f}  "
+                            f"TO={res['turnover']:.3f}  NetSR={res['sr_cost']:+.3f}")
         except Exception as e:
             logger.error(f"  {name:25s}  计算失败: {e}")
 
@@ -385,7 +480,9 @@ def main():
     for name in selected:
         res = factor_results[name]
         logger.info(f"    {name:25s}  SR={res['sr']:+.3f}  AR={res['ar']:+.3f}  "
-                    f"IC_mean={res['ic_mean']:+.4f}  IC_IR={res['ic_ir']:+.2f}")
+                    f"IC={res['ic_mean']:+.4f}  IC_IR={res['ic_ir']:+.2f}  "
+                    f"LngAR={res['ar_pos']:+.3f}  ShtAR={res['ar_neg']:+.3f}  "
+                    f"TO={res['turnover']:.3f}  NetSR={res['sr_cost']:+.3f}")
 
     # ---- 相关矩阵热力图 ----
     logger.info("\n=== 生成因子相关矩阵热力图 ===")
@@ -405,6 +502,26 @@ def main():
     plt.close()
     logger.info(f"  热力图已保存: {corr_path}")
 
+    # ---- 五分位分组收益曲线 ----
+    logger.info("\n=== 生成因子五分位分组收益曲线 ===")
+    n_sel = len(selected)
+    n_cols = min(5, n_sel)
+    n_rows = (n_sel + n_cols - 1) // n_cols
+    fig_q, axes_q = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+    axes_flat = axes_q.flatten() if n_sel > 1 else [axes_q]
+    for idx, name in enumerate(selected):
+        _plot_quantile_returns(
+            factors_raw[name], totalRet, univ_mask, listed,
+            name, axes_flat[idx])
+    for idx in range(n_sel, len(axes_flat)):
+        axes_flat[idx].axis('off')
+    fig_q.suptitle('Selected Factors — Quintile Cumulative Returns', fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    qr_path = os.path.join(output_dir, 'quantile_returns.png')
+    plt.savefig(qr_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  分组收益图已保存: {qr_path}")
+
     # ---- 保存因子数据 ----
     selected_factors = {name: factor_stands[name] for name in selected}
     save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -419,13 +536,15 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("10个达标因子汇总表")
     logger.info("=" * 80)
-    header = f"{'因子名':<25s} {'Sharpe':>8s} {'AnnRet':>8s} {'IC_mean':>8s} {'IC_IR':>8s}"
+    header = f"{'因子名':<25s} {'Sharpe':>8s} {'AnnRet':>8s} {'IC_mean':>8s} {'IC_IR':>7s} {'LngAR':>8s} {'ShtAR':>8s} {'Turnover':>9s} {'NetSR':>8s}"
     logger.info(header)
-    logger.info("-" * 60)
+    logger.info("-" * 100)
     for name in selected:
         res = factor_results[name]
         logger.info(f"{name:<25s} {res['sr']:>+8.3f} {res['ar']:>+8.3f} "
-                    f"{res['ic_mean']:>+8.4f} {res['ic_ir']:>+8.2f}")
+                    f"{res['ic_mean']:>+8.4f} {res['ic_ir']:>+7.2f} "
+                    f"{res['ar_pos']:>+8.3f} {res['ar_neg']:>+8.3f} "
+                    f"{res['turnover']:>9.3f} {res['sr_cost']:>+8.3f}")
 
     logger.info("\n完成！")
 
