@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+
 # ============================================================================
 # 2. 日志配置（控制台 + 文件）
 # ============================================================================
@@ -48,7 +49,6 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 from feature import *
 from tools import read_json_config
-
 # ============================================================================
 # 4. 加载自定义算子
 #    使用 importlib 绕过目录名 "01_feature_engineering" 以数字开头的限制
@@ -93,8 +93,12 @@ else:
     path1000 = config['paths']['S1000']
 path1000_matrix = path1000 + 'matrix//'
 
-SD       = '2017-01-01'       # 数据起始日
-SD_PER   = '2017-12-31'       # 业绩评价起始日（避免前视偏差）
+SD       = '2021-01-01'       # 数据起始日
+SD_PER   = '2021-12-31'       # 业绩评价起始日（避免前视偏差）
+
+logger.info("=== 运行参数 ===")
+logger.info(f"  数据起始日 (SD)    : {SD}")
+logger.info(f"  评价起始日 (SD_PER): {SD_PER}")
 
 REQUIRED_FIELDS = {
     'totalRet', 'close', 'open', 'high', 'low', 'pre_close', 'vwap',
@@ -152,6 +156,7 @@ for v in dt.keys():
     dt[v][listed == 0] = np.nan
 
 logger.info(f"  数据日期范围: {list(dt['close'].index[[0, -1]])}")
+logger.info(f"  截止日期 (END)    : {dt['close'].index[-1].strftime('%Y-%m-%d')}")
 logger.info(f"  股票数量: {dt['close'].shape[1]}")
 
 # ============================================================================
@@ -162,18 +167,20 @@ def compute_all_factors(dt):
     f = {}  # 因子容器
 
     # ----- 动量类 (1-7) -----
-    f['FF_MOM_1M']        = ts_DecayExp(dt['totalRet'], 21)
-    f['FF_MOM_3M']        = ts_DecayExp(dt['totalRet'], 63)
-    f['FF_MOM_6M_SKIP']   = ts_DecayExp(ts_Delay(dt['totalRet'], 21), 126)
-    f['FF_RSTR_LIKE']     = ts_Sum(dt['totalRet'].shift(21), 252)
-    f['FF_ABNORM_VOL']    = safe_div(dt['vol'], ts_Mean(dt['vol'], 20)) - 1
+    # 中证1000小盘股中 1M/3M 动量实际表现为反转，翻号
+    f['FF_MOM_1M']        = -ts_DecayExp(dt['totalRet'], 21)
+    f['FF_MOM_3M']        = -ts_DecayExp(dt['totalRet'], 63)
+    f['FF_MOM_6M_SKIP']   =  ts_DecayExp(ts_Delay(dt['totalRet'], 21), 126)
+    f['FF_RSTR_LIKE']     =  ts_Sum(dt['totalRet'].shift(21), 252)
+    f['FF_ABNORM_VOL']    = 1 - safe_div(dt['vol'], ts_Mean(dt['vol'], 20))  # 换手骤降→看涨
     f['FF_VOL_PRICE_CORR']= -ts_Corr(dt['close'], dt['vol'], 20)
-    f['FF_TURNOVER_MOM']  = ts_ChgRate(dt['turnover_rate'], 21)
+    f['FF_TURNOVER_MOM']  = -ts_ChgRate(dt['turnover_rate'], 21)             # 换手减速→看涨
 
     # ----- 反转类 (8-11) -----
+    # 中证1000中 隔夜/开盘缺口表现为动量而非反转，翻号
     f['FF_REV_5D']        = -ts_Sum(dt['totalRet'], 5)
-    f['FF_REV_OVERNIGHT'] = -dt['overnightRet']
-    f['FF_REV_GAP']       = -safe_div(dt['open'] - ts_Delay(dt['close'], 1), ts_Delay(dt['close'], 1))
+    f['FF_REV_OVERNIGHT'] =  dt['overnightRet']                              # 隔夜动量
+    f['FF_REV_GAP']       =  safe_div(dt['open'] - ts_Delay(dt['close'], 1), ts_Delay(dt['close'], 1))  # 缺口动量
     f['FF_LONG_REV']      = -ts_Sum(dt['totalRet'], 252)
 
     # ----- 波动率类 (12-18) -----
@@ -187,25 +194,26 @@ def compute_all_factors(dt):
 
     # ----- 流动性类 (19-24) -----
     f['FF_TURNOVER']      = -dt['turnover_rate']
-    f['FF_AMIHUD']        = -ts_Amihud(dt['totalRet'], dt['amount'], 20)
-    f['FF_VOLUME_RATIO']  =  safe_div(dt['vol'], ts_Mean(dt['vol'], 5))
+    f['FF_AMIHUD']        =  ts_Amihud(dt['totalRet'], dt['amount'], 20)     # 非流动性溢价(原负号翻转)
+    f['FF_VOLUME_RATIO']  = -safe_div(dt['vol'], ts_Mean(dt['vol'], 5))     # 缩量→看涨
     f['FF_FREEFLOAT_TO']  = -safe_div(dt['vol'], dt['free_share'], 0)
-    f['FF_AMOUNT_STD']    =  ts_Stdev(dt['amount'], 20)
+    f['FF_AMOUNT_STD']    = -ts_Stdev(dt['amount'], 20)                      # 成交额低波→看涨
     f['FF_LIQ_DECAY']     =  ts_Decay(-dt['turnover_rate'], 20)
 
     # ----- 资金流类 (25-28) -----
+    # 小盘股资金流信号存在延迟/反向，翻号
     if 'net_mf_amount' in dt and 'amount' in dt:
-        f['FF_NET_MF']    = safe_div(dt['net_mf_amount'], dt['amount'] * 1000)
+        f['FF_NET_MF']    = -safe_div(dt['net_mf_amount'], dt['amount'] * 1000)
     has_mf = all(k in dt for k in ['buy_lg_vol', 'buy_elg_vol', 'vol'])
     if has_mf:
-        f['FF_LARGE_BUY'] =  safe_div(dt['buy_lg_vol'] + dt['buy_elg_vol'], dt['vol'], 0)
+        f['FF_LARGE_BUY'] = -safe_div(dt['buy_lg_vol'] + dt['buy_elg_vol'], dt['vol'], 0)
         f['FF_LARGE_SELL']= -safe_div(dt['sell_lg_vol'] + dt['sell_elg_vol'], dt['vol'], 0)
     if 'net_mf_amount' in dt:
-        f['FF_MF_DECAY']  = ts_Decay(safe_div(dt['net_mf_amount'], dt['amount'] * 1000), 20)
+        f['FF_MF_DECAY']  = ts_Decay(-safe_div(dt['net_mf_amount'], dt['amount'] * 1000), 20)
 
     # ----- 技术类 (29-36) -----
     f['FF_VWAP_DEV']      = -safe_div(dt['close'] - dt['vwap'], dt['vwap'])
-    f['FF_BOLL_PCTB']     =  ts_BBOLL_PctB(dt['close'], 20, 2)
+    f['FF_BOLL_PCTB']     = -ts_BBOLL_PctB(dt['close'], 20, 2)              # 低位反弹(原无负号)
     f['FF_MACD']          = -ts_MACD(dt['close'], 12, 26, 9)
     pos_ret = dt['totalRet'].clip(lower=0)
     neg_ret = (-dt['totalRet']).clip(lower=0)
@@ -227,9 +235,10 @@ def compute_all_factors(dt):
     f['FF_TO_F']          = -dt['turnover_rate_f']
 
     # ----- 特质类 (43-45) -----
-    f['FF_IDIO_MOM']      =  ts_Sum(dt['totalRet'], 20)
-    f['FF_PCT_CHG']       = -dt['pct_chg']
-    f['FF_EXRET_5D']      =  ts_Sum(dt['exRet'], 5)
+    # 短期特质收益表现为反转
+    f['FF_IDIO_MOM']      = -ts_Sum(dt['totalRet'], 20)
+    f['FF_PCT_CHG']       =  dt['pct_chg']                                  # 涨跌幅动量(原负号翻转)
+    f['FF_EXRET_5D']      = -ts_Sum(dt['exRet'], 5)
 
     return f
 
